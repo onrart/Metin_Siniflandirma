@@ -544,8 +544,5 @@ with tabs[2]:
                 )
 
 st.caption(
-    "Notlar: 1) GPU kullanıyorsan doğru CUDA Torch paketini kur. "
-    "2) Private HF repo için HUGGINGFACE_HUB_TOKEN ortam değişkenini ayarla. "
-    "3) MODEL_REVISION vererek belirli bir commit'e sabitleyebilirsin. "
-    "4) Bu uygulama tek-aktif model çalışır; model değiştirince önceki pipeline boşaltılır."
+    "Notlar: 1) Bu uygulama tek-aktif model çalışır; model değiştirince önceki pipeline boşaltılır."
 )
