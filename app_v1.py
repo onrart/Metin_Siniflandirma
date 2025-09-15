@@ -1,8 +1,8 @@
 # app.py
 import os
+import io
 from typing import List, Dict, Any, Optional, Tuple
 
-import io
 import pandas as pd
 import streamlit as st
 import torch
@@ -14,10 +14,11 @@ from transformers import (
 )
 from huggingface_hub import snapshot_download
 
+# ==========================
 # .env (opsiyonel)
+# ==========================
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
     pass
@@ -25,10 +26,13 @@ except Exception:
 st.set_page_config(page_title="Metin Sınıflandırma (HF Pipeline)", layout="wide")
 
 # ==========================
-# Ortam değişkenleri (varsayılanlar)
+# Ortam değişkenleri
 # ==========================
-ENV_MODEL_PATH = os.getenv("MODEL_PATH", "onrart/final_model")  # default
-ENV_MODEL_REVISION = os.getenv("MODEL_REVISION", None)          # örn: "main" veya commit hash
+ENV_MODEL_PATH1 = os.getenv("MODEL_PATH1", "onrart/final_model")
+ENV_MODEL_PATH2 = os.getenv("MODEL_PATH2", "onrart/bertuk_v1")
+ENV_MODEL_PATH3 = os.getenv("MODEL_PATH3", "onrart/mdeberta_v1")
+ENV_MODEL_REVISION = os.getenv("MODEL_REVISION", None)  # opsiyonel
+ENV_CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")       # streamlit için kritik değil, ileride API modunda kullanılabilir
 
 def _parse_int(s: Optional[str]) -> Optional[int]:
     try:
@@ -97,7 +101,6 @@ def load_classifier(model_id_or_path: str, device_index: Optional[int], revision
     device_for_pipeline = resolve_device(device_index)
     model_to_load = _resolve_model_source(model_id_or_path, revision)
 
-    # Tokenizer + Model
     tok = AutoTokenizer.from_pretrained(model_to_load)
     mdl = AutoModelForSequenceClassification.from_pretrained(
         model_to_load,
@@ -112,7 +115,7 @@ def load_classifier(model_id_or_path: str, device_index: Optional[int], revision
         device=device_for_pipeline,
     )
 
-    # Etiketleri config'ten çek (varsa)
+    # Etiketler
     labels: List[str] = []
     try:
         cfg = AutoConfig.from_pretrained(model_to_load)
@@ -170,7 +173,7 @@ def predict_texts(
         for text, scores in zip(texts, raw):
             filtered = [s for s in scores if float(s["score"]) >= threshold]
             if not filtered:
-                filtered = [max(scores, key=lambda s: float(s["score"]))]  # en yüksek en az 1
+                filtered = [max(scores, key=lambda s: float(s["score"]))]  # en az 1 etiket
             filtered.sort(key=lambda s: float(s["score"]), reverse=True)
             results.append(
                 {
@@ -248,19 +251,61 @@ def robust_read_csv(uploaded_file) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(raw), engine="python")
 
 # ==========================
-# UI — Sidebar: Model Seçimi ve Yükleme
+# Tek-aktif model: session state
+# ==========================
+if "classifier" not in st.session_state:
+    st.session_state.classifier = None
+if "labels" not in st.session_state:
+    st.session_state.labels = []
+if "device_used" not in st.session_state:
+    st.session_state.device_used = None
+if "active_model_signature" not in st.session_state:
+    st.session_state.active_model_signature = None  # (path, device_idx, revision)
+
+def unload_current_model():
+    """Cache ve GPU RAM boşalt."""
+    try:
+        st.session_state.classifier = None
+        st.session_state.labels = []
+        st.session_state.device_used = None
+        st.session_state.active_model_signature = None
+        try:
+            load_classifier.clear()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+def load_active_model(path: str, device_idx: Optional[int], rev: Optional[str]):
+    """Seçili modeli yükle; önce farklı bir model varsa boşalt."""
+    sig = (path, device_idx, rev)
+    if st.session_state.active_model_signature == sig and st.session_state.classifier is not None:
+        return
+    unload_current_model()
+    clf, labels, device_used = load_classifier(path, device_idx, rev)
+    st.session_state.classifier = clf
+    st.session_state.labels = labels
+    st.session_state.device_used = device_used
+    st.session_state.active_model_signature = sig
+
+# ==========================
+# UI — Sidebar
 # ==========================
 st.sidebar.header("⚙️ Ayarlar")
 
-# Hazır modeller
+# Hazır modeller (ENV'den)
 PREDEFINED_MODELS = {
-    "Final Model": "onrart/final_model",
-    "BERTurk v1": "onrart/bertuk_v1",
-    "mDeBERTa v1": "onrart/mdeberta_v1",
+    "Final Model": ENV_MODEL_PATH1,
+    "BERTurk v1": ENV_MODEL_PATH2,
+    "mDeBERTa v1": ENV_MODEL_PATH3,
     "Custom (kendi yolum)": None,
 }
 
-# Cihaz seçimi: ENV_DEVICE_INDEX'e göre başlangıç seçimi
+# Cihaz seçimi
 device_names, device_idxs = available_devices()
 
 def _default_device_index_from_env() -> int:
@@ -293,119 +338,46 @@ pipeline_batch_size = st.sidebar.number_input(
     "Pipeline batch size", min_value=1, max_value=128, value=32, step=1
 )
 
-# Tekil “aktif model” seçimi için menü (predefined + custom)
+# Model seçimi
 model_choice = st.sidebar.selectbox(
-    "Model seç (aktif)",
+    "Model seç",
     options=list(PREDEFINED_MODELS.keys()),
     index=0,
 )
 
 if PREDEFINED_MODELS[model_choice] is None:
-    # Kullanıcı özel model girecek
-    custom_model_path = st.sidebar.text_input(
+    # Custom model
+    model_path = st.sidebar.text_input(
         "Custom model yolu (HF repo id veya yerel klasör)",
-        value=ENV_MODEL_PATH,
+        value="",
         help="Örn: onrart/final_model veya ./final_model",
-    )
-    active_model_path = custom_model_path.strip()
+    ).strip()
 else:
-    active_model_path = PREDEFINED_MODELS[model_choice]
+    model_path = PREDEFINED_MODELS[model_choice]
 
-# Çoklu model ön-yükleme (başlangıçta)
-st.sidebar.markdown("---")
-st.sidebar.subheader("🧰 Başlangıçta ön-yüklenecek modeller")
-preload_options = [k for k in PREDEFINED_MODELS.keys() if PREDEFINED_MODELS[k] is not None]
-# Eğer custom girilmişse onu da seçenek olarak ekle
-if PREDEFINED_MODELS[model_choice] is None and active_model_path:
-    preload_options = preload_options + ["Custom (şu an girilen)"]
-
-preload_selection = st.sidebar.multiselect(
-    "Modelleri seç (isteğe bağlı)",
-    options=preload_options,
-    default=["Final Model"],  # varsayılan ön-yükleme
-)
-
-if "loaded_models" not in st.session_state:
-    # loaded_models: Dict[görünen_ad, dict(path=..., clf=..., labels=..., device=...)]
-    st.session_state.loaded_models = {}
-
-def _add_loaded_model(display_name: str, path: str):
-    if display_name in st.session_state.loaded_models:
-        return
-    clf, labels, device_used = load_classifier(path, chosen_device_index, revision)
-    st.session_state.loaded_models[display_name] = {
-        "path": path,
-        "clf": clf,
-        "labels": labels,
-        "device": device_used,
-    }
-
-# Ön-yükleme butonu
-if st.sidebar.button("Seçili modelleri ön-yükle", type="primary", use_container_width=True):
+# Yükle/Boşalt butonları
+load_disabled = (not model_path) and (PREDEFINED_MODELS[model_choice] is None)
+if st.sidebar.button("Modeli Yükle", type="primary", use_container_width=True, disabled=load_disabled):
     try:
-        for name in preload_selection:
-            if name == "Custom (şu an girilen)":
-                if active_model_path:
-                    _add_loaded_model("Custom", active_model_path)
-            else:
-                _add_loaded_model(name, PREDEFINED_MODELS[name])
-        st.sidebar.success("Ön-yükleme tamam.")
-    except Exception as e:
-        st.sidebar.error(f"Ön-yükleme hatası: {e}")
-
-# Aktif modeli yükle (eğer yüklü değilse tek başına da yüklenebilir)
-if st.sidebar.button("Aktif modeli yükle", use_container_width=True):
-    try:
-        disp_name = model_choice if PREDEFINED_MODELS[model_choice] is not None else "Custom"
-        _add_loaded_model(disp_name, active_model_path)
-        st.sidebar.success(f"Aktif model yüklendi: {disp_name}")
+        with st.spinner("Model yükleniyor..."):
+            load_active_model(model_path, chosen_device_index, revision)
+        st.sidebar.success(f"Model yüklendi · Cihaz: {st.session_state.device_used}")
+        if revision:
+            st.sidebar.caption(f"📌 Kullanılan sürüm: {revision}")
+        if st.session_state.labels:
+            st.sidebar.caption("Etiketler:")
+            st.sidebar.write(st.session_state.labels)
     except Exception as e:
         st.sidebar.error(f"Model yüklenemedi: {e}")
 
-# Yüklü modeller listesi ve aktif seçim
-loaded_names = list(st.session_state.loaded_models.keys())
-if loaded_names:
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("✅ Yüklü modeller")
-    pick_active_loaded = st.sidebar.selectbox(
-        "Aktif (yüklü) modeli seç",
-        options=loaded_names,
-        index=loaded_names.index(loaded_names[0]),
-    )
-    active_loaded = st.session_state.loaded_models[pick_active_loaded]
-    classifier = active_loaded["clf"]
-    labels = active_loaded["labels"]
-    device_used = active_loaded["device"]
-    st.sidebar.success(f"Aktif (yüklü) model: {pick_active_loaded} · Cihaz: {device_used}")
-    if revision:
-        st.sidebar.caption(f"📌 Kullanılan sürüm: {revision}")
-    if labels:
-        st.sidebar.caption("Etiketler:")
-        st.sidebar.write(labels)
-else:
-    # Hiçbir model önceden yüklenmediyse, anlık yükle ve kullan
-    with st.sidebar:
-        try:
-            with st.spinner("Model yükleniyor..."):
-                classifier, labels, device_used = load_classifier(active_model_path, chosen_device_index, revision)
-            st.success(f"Model yüklendi · Cihaz: {device_used}")
-            if revision:
-                st.caption(f"📌 Kullanılan sürüm: {revision}")
-            if labels:
-                st.caption("Etiketler:")
-                st.write(labels)
-        except Exception as e:
-            st.error(f"Model yüklenemedi: {e}")
-            st.stop()
+if st.sidebar.button("Modeli Boşalt", use_container_width=True):
+    unload_current_model()
+    st.sidebar.info("Aktif model boşaltıldı.")
 
-# ==========================
 # Genel sınıflandırma ayarları
-# ==========================
 multi_label = st.sidebar.toggle("Multi-label", value=False, help="Birden fazla etiket aynı anda seçilebilir")
 threshold = st.sidebar.slider("Eşik (multi-label)", 0.0, 1.0, 0.5, 0.01, disabled=not multi_label)
-top_k = st.sidebar.number_input(
-    "Top-K (single-label)", min_value=1, max_value=10, value=3, step=1, disabled=multi_label
-)
+top_k = st.sidebar.number_input("Top-K (single-label)", min_value=1, max_value=10, value=3, step=1, disabled=multi_label)
 max_length = st.sidebar.number_input("max_length", min_value=8, max_value=4096, value=512, step=8)
 truncation = st.sidebar.toggle("Truncation", value=True)
 csv_batch_size = st.sidebar.number_input("CSV batch size", min_value=8, max_value=4096, value=256, step=8)
@@ -414,6 +386,23 @@ csv_batch_size = st.sidebar.number_input("CSV batch size", min_value=8, max_valu
 # UI — İçerik
 # ==========================
 st.title("🧠 Metin Sınıflandırma — Streamlit (HF Pipeline)")
+
+# Model yüklü mü?
+if st.session_state.classifier is None:
+    st.warning("Önce sol menüden modeli seçip **Modeli Yükle**'ye bas.")
+    st.stop()
+
+classifier = st.session_state.classifier
+labels = st.session_state.labels
+device_used = st.session_state.device_used
+
+# top_k'yi etiket sayısına göre sınırla
+if labels:
+    max_top_k = max(1, min(10, len(labels)))
+else:
+    max_top_k = 10
+if not multi_label:
+    top_k = min(top_k, max_top_k)
 
 tabs = st.tabs(["Tek Metin", "Çoklu Metin", "CSV Yükle"])
 
@@ -558,5 +547,5 @@ st.caption(
     "Notlar: 1) GPU kullanıyorsan doğru CUDA Torch paketini kur. "
     "2) Private HF repo için HUGGINGFACE_HUB_TOKEN ortam değişkenini ayarla. "
     "3) MODEL_REVISION vererek belirli bir commit'e sabitleyebilirsin. "
-    "4) Çoklu model ön-yükleme için sol menüden seçim yap; 'Aktif (yüklü) modeli seç' ile hızla geçiş yap."
+    "4) Bu uygulama tek-aktif model çalışır; model değiştirince önceki pipeline boşaltılır."
 )
